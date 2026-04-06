@@ -1,0 +1,20 @@
+{
+  "name": "local-render-suite-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "set PATH=D:\\Nodejs;%USERPROFILE%\\.cargo\\bin;%PATH%&& vite",
+    "build": "set PATH=D:\\Nodejs;%USERPROFILE%\\.cargo\\bin;%PATH%&& tsc && vite build",
+    "tauri:dev": "set PATH=D:\\Nodejs;%USERPROFILE%\\.cargo\\bin;%PATH%&& tauri dev",
+    "tauri:build": "set PATH=D:\\Nodejs;%USERPROFILE%\\.cargo\\bin;%PATH%&& tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.8"
+  }
+}
