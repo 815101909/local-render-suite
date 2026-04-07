@@ -134,6 +134,17 @@ struct DraftBlueprint {
   resource_plan: Vec<DraftBlueprintResource>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleAnimationOption {
+  key: String,
+  name: String,
+  effect_id: String,
+  resource_id: String,
+  default_duration_us: u64,
+  is_vip: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PipelineResult {
@@ -228,6 +239,19 @@ fn now_millis() -> u64 {
     .duration_since(UNIX_EPOCH)
     .map(|duration| duration.as_millis() as u64)
     .unwrap_or(0)
+}
+
+fn create_draft_material_id(seed: &str, index: usize) -> String {
+  let now = now_millis();
+  let mut first_hasher = DefaultHasher::new();
+  format!("{}::{}::{}", seed, index, now).hash(&mut first_hasher);
+  let first = first_hasher.finish();
+
+  let mut second_hasher = DefaultHasher::new();
+  format!("{}::{}::{}", now, seed, first).hash(&mut second_hasher);
+  let second = second_hasher.finish();
+
+  format!("{:016X}{:016X}", first, second)
 }
 
 /**
@@ -588,6 +612,265 @@ fn repair_downloaded_video_timings(
         object.insert("source_duration_ms".to_string(), json!(actual_duration_us / 1000));
       }
     }
+  }
+}
+
+#[derive(Debug, Clone)]
+struct TextAnimationSegmentPatch {
+  track_index: usize,
+  segment_index: usize,
+  animation_ref_ids: Vec<String>,
+  target_animation_id: Option<String>,
+  segment_duration_us: u64,
+}
+
+fn build_subtitle_animation_material(
+  animation_material_id: &str,
+  subtitle_animation: &SubtitleAnimationOption,
+  segment_duration_us: u64,
+) -> Value {
+  let animation_duration_us = std::cmp::min(
+    std::cmp::max(200_000, segment_duration_us),
+    std::cmp::max(1, subtitle_animation.default_duration_us),
+  );
+
+  json!({
+    "animations": [{
+      "anim_adjust_params": null,
+      "duration": animation_duration_us,
+      "id": subtitle_animation.effect_id,
+      "material_type": "sticker",
+      "name": subtitle_animation.name,
+      "panel": "",
+      "platform": "all",
+      "request_id": "",
+      "resource_id": subtitle_animation.resource_id,
+      "start": 0,
+      "type": "in",
+    }],
+    "id": animation_material_id,
+    "multi_language_current": "none",
+    "type": "sticker_animation",
+  })
+}
+
+fn apply_local_subtitle_animation(
+  draft_content: &mut Value,
+  subtitle_animation: Option<&SubtitleAnimationOption>,
+) {
+  let Some(subtitle_animation) = subtitle_animation else {
+    return;
+  };
+
+  let normalized_key = subtitle_animation.key.trim().to_ascii_lowercase();
+  if normalized_key.is_empty() || normalized_key == "inherit" {
+    return;
+  }
+
+  let should_clear_animation = normalized_key == "none"
+    || (subtitle_animation.effect_id.trim().is_empty() && subtitle_animation.resource_id.trim().is_empty());
+
+  let existing_animation_ids = draft_content
+    .get("materials")
+    .and_then(|value| value.get("material_animations"))
+    .and_then(Value::as_array)
+    .map(|items| {
+      items.iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("sticker_animation"))
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(ToString::to_string))
+        .collect::<HashSet<String>>()
+    })
+    .unwrap_or_default();
+
+  let mut patches: Vec<TextAnimationSegmentPatch> = Vec::new();
+  if let Some(tracks) = draft_content.get("tracks").and_then(Value::as_array) {
+    for (track_index, track) in tracks.iter().enumerate() {
+      let Some(segments) = track.get("segments").and_then(Value::as_array) else {
+        continue;
+      };
+
+      for (segment_index, segment) in segments.iter().enumerate() {
+        if segment.get("type").and_then(Value::as_str) != Some("text") {
+          continue;
+        }
+
+        let animation_ref_ids = segment
+          .get("extra_material_refs")
+          .and_then(Value::as_array)
+          .map(|items| {
+            items.iter()
+              .filter_map(Value::as_str)
+              .filter(|item| existing_animation_ids.contains(*item))
+              .map(ToString::to_string)
+              .collect::<Vec<String>>()
+          })
+          .unwrap_or_default();
+
+        let target_animation_id = if should_clear_animation {
+          None
+        } else if let Some(existing_id) = animation_ref_ids.first() {
+          Some(existing_id.clone())
+        } else {
+          let seed = segment
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| segment.get("material_id").and_then(Value::as_str))
+            .unwrap_or("LOCAL_TEXT_ANIMATION");
+          Some(create_draft_material_id(seed, patches.len()))
+        };
+
+        let segment_duration_us = segment
+          .get("target_timerange")
+          .and_then(|value| value.get("duration"))
+          .and_then(Value::as_u64)
+          .or_else(|| {
+            segment
+              .get("render_timerange")
+              .and_then(|value| value.get("duration"))
+              .and_then(Value::as_u64)
+          })
+          .unwrap_or(0);
+
+        patches.push(TextAnimationSegmentPatch {
+          track_index,
+          segment_index,
+          animation_ref_ids,
+          target_animation_id,
+          segment_duration_us,
+        });
+      }
+    }
+  }
+
+  if patches.is_empty() {
+    return;
+  }
+
+  let Some(materials_object) = draft_content
+    .as_object_mut()
+    .and_then(|value| value.get_mut("materials"))
+    .and_then(Value::as_object_mut)
+  else {
+    return;
+  };
+
+  if !materials_object.contains_key("material_animations") {
+    materials_object.insert("material_animations".to_string(), Value::Array(Vec::new()));
+  }
+
+  let Some(material_animations) = materials_object
+    .get_mut("material_animations")
+    .and_then(Value::as_array_mut)
+  else {
+    return;
+  };
+
+  let mut material_index_by_id: HashMap<String, usize> = HashMap::new();
+  for (index, material) in material_animations.iter().enumerate() {
+    if let Some(material_id) = material.get("id").and_then(Value::as_str) {
+      material_index_by_id.insert(material_id.to_string(), index);
+    }
+  }
+
+  let mut ids_to_clear: HashSet<String> = HashSet::new();
+  let mut desired_materials: HashMap<String, Value> = HashMap::new();
+  for patch in &patches {
+    if let Some(target_id) = &patch.target_animation_id {
+      desired_materials.insert(
+        target_id.clone(),
+        build_subtitle_animation_material(target_id, subtitle_animation, patch.segment_duration_us),
+      );
+    }
+
+    for animation_ref_id in &patch.animation_ref_ids {
+      if should_clear_animation || patch.target_animation_id.as_deref() != Some(animation_ref_id.as_str()) {
+        ids_to_clear.insert(animation_ref_id.clone());
+      }
+    }
+  }
+
+  for clear_id in ids_to_clear {
+    let empty_material = json!({
+      "animations": [],
+      "id": clear_id,
+      "multi_language_current": "none",
+      "type": "sticker_animation",
+    });
+
+    if let Some(existing_index) = material_index_by_id.get(&clear_id).copied() {
+      material_animations[existing_index] = empty_material;
+      continue;
+    }
+
+    material_index_by_id.insert(clear_id.clone(), material_animations.len());
+    material_animations.push(empty_material);
+  }
+
+  for (material_id, material) in desired_materials {
+    if let Some(existing_index) = material_index_by_id.get(&material_id).copied() {
+      material_animations[existing_index] = material;
+      continue;
+    }
+
+    material_index_by_id.insert(material_id.clone(), material_animations.len());
+    material_animations.push(material);
+  }
+
+  let Some(tracks) = draft_content.get_mut("tracks").and_then(Value::as_array_mut) else {
+    return;
+  };
+
+  for patch in patches {
+    if patch.animation_ref_ids.is_empty() && patch.target_animation_id.is_none() {
+      continue;
+    }
+
+    let Some(track) = tracks.get_mut(patch.track_index) else {
+      continue;
+    };
+    let Some(segments) = track.get_mut("segments").and_then(Value::as_array_mut) else {
+      continue;
+    };
+    let Some(segment) = segments.get_mut(patch.segment_index) else {
+      continue;
+    };
+    let Some(segment_object) = segment.as_object_mut() else {
+      continue;
+    };
+
+    let extra_refs_value = segment_object
+      .entry("extra_material_refs".to_string())
+      .or_insert_with(|| Value::Array(Vec::new()));
+    if !extra_refs_value.is_array() {
+      *extra_refs_value = Value::Array(Vec::new());
+    }
+
+    let Some(extra_refs) = extra_refs_value.as_array_mut() else {
+      continue;
+    };
+
+    let mut next_refs: Vec<Value> = extra_refs
+      .iter()
+      .filter(|value| {
+        let Some(material_id) = value.as_str() else {
+          return true;
+        };
+        !patch.animation_ref_ids.iter().any(|item| item == material_id)
+      })
+      .cloned()
+      .collect();
+
+    if let Some(target_animation_id) = &patch.target_animation_id {
+      let already_exists = next_refs
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|item| item == target_animation_id);
+      if !already_exists {
+        next_refs.push(Value::String(target_animation_id.clone()));
+      }
+    }
+
+    *extra_refs = next_refs;
   }
 }
 
@@ -1460,6 +1743,7 @@ async fn run_local_pipeline_inner(
   backend_url: &str,
   uid: &str,
   output_root: Option<String>,
+  subtitle_animation: Option<SubtitleAnimationOption>,
   device: &DeviceIdentity,
 ) -> Result<PipelineResult, String> {
   let client = build_http_client()?;
@@ -1760,6 +2044,7 @@ async fn run_local_pipeline_inner(
     &video_duration_by_absolute_path,
     &video_duration_by_relative_path,
   );
+  apply_local_subtitle_animation(&mut blueprint.draft_content, subtitle_animation.as_ref());
   let draft_content_path = output_dir.join("draft_content.json");
   let draft_meta_info_path = output_dir.join("draft_meta_info.json");
   let manifest_path = output_dir.join("manifest.json");
@@ -1857,9 +2142,17 @@ async fn run_local_pipeline(
   backend_url: String,
   uid: String,
   output_root: Option<String>,
+  subtitle_animation: Option<SubtitleAnimationOption>,
 ) -> Result<PipelineResult, String> {
   let device = build_device_identity();
-  let mut result = run_local_pipeline_inner(&window, &backend_url, &uid, output_root, &device).await;
+  let mut result = run_local_pipeline_inner(
+    &window,
+    &backend_url,
+    &uid,
+    output_root,
+    subtitle_animation,
+    &device,
+  ).await;
   if let Ok(pipeline_result) = &mut result {
     pipeline_result.task.progress = progress_store.get(&uid);
   }
