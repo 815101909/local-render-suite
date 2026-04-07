@@ -201,10 +201,117 @@ input:focus {
   padding: 18px;
 }
 
+.execution-log-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.panel-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-subhead strong {
+  font-size: 16px;
+}
+
+.panel-subhead span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .progress-box {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.stage-track {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.stage-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.stage-node-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  flex: 0 0 auto;
+}
+
+.stage-node-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.stage-node-done .stage-node-dot,
+.stage-node-active .stage-node-dot {
+  background: var(--accent);
+}
+
+.stage-node-done .stage-node-label,
+.stage-node-active .stage-node-label {
+  color: var(--text);
+}
+
+.stage-node-active {
+  border-color: rgba(255, 122, 47, 0.35);
+  background: rgba(255, 122, 47, 0.1);
+}
+
+.stage-node-failed {
+  border-color: rgba(255, 106, 106, 0.28);
+  background: rgba(255, 106, 106, 0.08);
+}
+
+.stage-node-failed .stage-node-dot {
+  background: #ff6a6a;
+}
+
+.stage-node-failed .stage-node-label {
+  color: #ffd1d1;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.metric-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.metric-card span,
+.metric-card em {
+  color: var(--muted);
+  font-style: normal;
+  font-size: 13px;
+}
+
+.metric-card strong {
+  font-size: 20px;
+  line-height: 1.2;
 }
 
 .progress-box-head,
@@ -241,11 +348,19 @@ input:focus {
   background: rgba(47, 199, 160, 0.14);
 }
 
+.progress-bar-shots {
+  background: rgba(255, 178, 74, 0.12);
+}
+
 .progress-bar-fill {
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(135deg, var(--accent), #ffb24a);
   transition: width 0.18s ease;
+}
+
+.progress-bar-fill-shots {
+  background: linear-gradient(135deg, #ffb24a, #ffd38b);
 }
 
 .uid-line {
@@ -285,6 +400,14 @@ input:focus {
   line-height: 1.6;
 }
 
+.embedded-log-box {
+  min-height: 148px;
+  max-height: 220px;
+  margin-top: 0;
+  font-family: "Consolas", "SFMono-Regular", monospace;
+  font-size: 13px;
+}
+
 .empty-tip,
 .loading-tip {
   color: var(--muted);
@@ -311,6 +434,11 @@ code {
   .hero,
   .content-grid,
   .inline-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stage-track,
+  .metric-grid {
     grid-template-columns: 1fr;
   }
 }

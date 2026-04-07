@@ -11,9 +11,9 @@
 use reqwest::{header::ACCEPT_ENCODING, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fs::File;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::env;
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::windows::process::CommandExt;
@@ -138,8 +138,6 @@ struct PipelineResult {
   output_dir: String,
   manifest_path: String,
   compose_script_path: String,
-  final_video_path: Option<String>,
-  ffmpeg_executed: bool,
   note: String,
 }
 
@@ -151,6 +149,8 @@ struct PipelineProgressPayload {
   message: String,
   current_file: String,
   current_shot_no: u32,
+  completed_shots: u32,
+  total_shots: u32,
   current_file_downloaded_bytes: u64,
   current_file_total_bytes: u64,
   current_file_progress: f64,
@@ -165,6 +165,8 @@ struct DownloadProgressMeta {
   message: String,
   current_file: String,
   current_shot_no: u32,
+  completed_shots: u32,
+  total_shots: u32,
   overall_completed: u32,
   overall_total: u32,
 }
@@ -187,30 +189,10 @@ struct ClaimPayload {
   device_name: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LocalAssetManifestItem {
-  shot_no: u32,
-  title: String,
-  asset_type: String,
-  source_url: String,
-  local_path: String,
-  duration_ms: u64,
-  segment_path: String,
-  source_kind: String,
-  crop_config: Option<TaskCropConfig>,
-}
-
 /**
  * 当前时间戳
  * @return {u64} 毫秒时间戳
  */
-fn now_millis() -> u64 {
-  std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .map(|item| item.as_millis() as u64)
-    .unwrap_or_default()
-}
 
 /**
  * 归一化百分比
@@ -252,6 +234,8 @@ fn emit_stage_progress(
   message: &str,
   current_file: &str,
   current_shot_no: u32,
+  completed_shots: u32,
+  total_shots: u32,
   overall_completed: u32,
   overall_total: u32,
 ) {
@@ -261,6 +245,8 @@ fn emit_stage_progress(
     message: message.to_string(),
     current_file: current_file.to_string(),
     current_shot_no,
+    completed_shots,
+    total_shots,
     current_file_downloaded_bytes: 0,
     current_file_total_bytes: 0,
     current_file_progress: 0.0,
@@ -340,9 +326,6 @@ fn path_to_string(target: &Path) -> String {
  * @param raw 原始文本
  * @return {String} 引号包裹后的文本
  */
-fn ps_quote(raw: &str) -> String {
-  format!("'{}'", raw.replace("'", "''"))
-}
 
 /**
  * URL 推导文件名
@@ -367,14 +350,6 @@ fn file_name_from_url(raw_url: &str, fallback: &str) -> String {
  * @param aspect_ratio 比例
  * @return {(u32, u32)} 宽高
  */
-fn ratio_to_resolution(aspect_ratio: &str) -> (u32, u32) {
-  match aspect_ratio {
-    "9:16" => (1080, 1920),
-    "1:1" => (1080, 1080),
-    "4:3" => (1440, 1080),
-    _ => (1920, 1080),
-  }
-}
 
 /**
  * 预览图高度
@@ -382,18 +357,6 @@ fn ratio_to_resolution(aspect_ratio: &str) -> (u32, u32) {
  * @param ratio 画幅比例
  * @return {f64} 预览高度
  */
-fn get_preview_height(preview_width: f64, ratio: &str) -> f64 {
-  let parts = ratio.split(':').collect::<Vec<_>>();
-  if parts.len() != 2 {
-    return preview_width;
-  }
-  let width_ratio = parts[0].parse::<f64>().unwrap_or(1.0);
-  let height_ratio = parts[1].parse::<f64>().unwrap_or(1.0);
-  if width_ratio <= 0.0 || height_ratio <= 0.0 {
-    return preview_width;
-  }
-  preview_width * (height_ratio / width_ratio)
-}
 
 /**
  * 构建 atlas 裁切表达式
@@ -402,41 +365,6 @@ fn get_preview_height(preview_width: f64, ratio: &str) -> f64 {
  * @param crop_config 裁切配置
  * @return {String} ffmpeg filter 片段
  */
-fn build_atlas_crop_filter(shot_no: u32, ratio: &str, crop_config: &TaskCropConfig) -> String {
-  let preview_width = if ratio == "9:16" { 220.0 } else { 300.0 };
-  let preview_height = get_preview_height(preview_width, ratio);
-  let scale = if crop_config.scale > 1.0 { crop_config.scale } else { 1.02 };
-  let offset_x = crop_config.offset_x;
-  let offset_y = crop_config.offset_y;
-  let cell_index = (shot_no.saturating_sub(1) % 9) as u32;
-  let row = cell_index / 3;
-  let col = cell_index % 3;
-  let x_base_expr = if col == 0 {
-    "0".to_string()
-  } else if col == 1 {
-    format!("(iw-iw/{:.4})/2", 3.0 * scale)
-  } else {
-    format!("iw-iw/{:.4}", 3.0 * scale)
-  };
-  let y_base_expr = if row == 0 {
-    "0".to_string()
-  } else if row == 1 {
-    format!("(ih-ih/{:.4})/2", 3.0 * scale)
-  } else {
-    format!("ih-ih/{:.4}", 3.0 * scale)
-  };
-  let offset_x_expr = format!("{}*iw/{:.4}", offset_x, preview_width * 3.0 * scale);
-  let offset_y_expr = format!("{}*ih/{:.4}", offset_y, preview_height * 3.0 * scale);
-  format!(
-    "crop=iw/{:.4}:ih/{:.4}:{}-{}:{}-{}",
-    3.0 * scale,
-    3.0 * scale,
-    x_base_expr,
-    offset_x_expr,
-    y_base_expr,
-    offset_y_expr,
-  )
-}
 
 /**
  * 当前电脑是否具备 ffmpeg
@@ -876,6 +804,8 @@ async fn download_file_with_progress(
     message: meta.message.clone(),
     current_file: meta.current_file.clone(),
     current_shot_no: meta.current_shot_no,
+    completed_shots: meta.completed_shots,
+    total_shots: meta.total_shots,
     current_file_downloaded_bytes: 0,
     current_file_total_bytes: total_bytes,
     current_file_progress: 0.0,
@@ -904,6 +834,8 @@ async fn download_file_with_progress(
       message: meta.message.clone(),
       current_file: meta.current_file.clone(),
       current_shot_no: meta.current_shot_no,
+      completed_shots: meta.completed_shots,
+      total_shots: meta.total_shots,
       current_file_downloaded_bytes: downloaded_bytes,
       current_file_total_bytes: total_bytes,
       current_file_progress,
@@ -930,6 +862,7 @@ async fn download_file_with_progress(
  * @param height 高
  * @return {Result<(), String>} 执行结果
  */
+#[cfg(any())]
 async fn write_compose_script(
   script_path: &Path,
   local_assets: &[LocalAssetManifestItem],
@@ -1031,6 +964,7 @@ async fn write_compose_script(
  * @param args ffmpeg 参数
  * @return {Result<(), String>} 执行结果
  */
+#[cfg(any())]
 fn run_ffmpeg_with_progress(
   window: &Window,
   uid: &str,
@@ -1139,6 +1073,7 @@ fn run_ffmpeg_with_progress(
  * @param height 高
  * @return {Result<String, String>} 最终视频路径
  */
+#[cfg(any())]
 fn try_compose_with_ffmpeg(
   window: &Window,
   uid: &str,
@@ -1304,11 +1239,12 @@ async fn run_local_pipeline_inner(
   device: &DeviceIdentity,
 ) -> Result<PipelineResult, String> {
   let client = build_http_client()?;
-  let mut task = fetch_task(&client, backend_url, uid).await?;
-  emit_stage_progress(window, uid, "loaded", "任务详情已加载", "", 0, 0, 0);
-  emit_stage_progress(window, uid, "claiming", "正在认领任务", "", 0, 0, 0);
+  let task_detail = fetch_task(&client, backend_url, uid).await?;
+  let total_shots = task_detail.shots.len() as u32;
+  emit_stage_progress(window, uid, "loaded", "任务详情已加载", "", 0, 0, total_shots, 0, 0);
+  emit_stage_progress(window, uid, "claiming", "正在认领任务", "", 0, 0, total_shots, 0, 0);
   claim_task(&client, backend_url, uid, device).await?;
-  task = update_task_status(
+  update_task_status(
     &client,
     backend_url,
     uid,
@@ -1318,7 +1254,7 @@ async fn run_local_pipeline_inner(
     None,
   )
   .await?;
-  emit_stage_progress(window, uid, "preparing", "正在生成草稿蓝图", "", 0, 0, 0);
+  emit_stage_progress(window, uid, "preparing", "正在生成草稿蓝图", "", 0, 0, total_shots, 0, 0);
   let output_root_dir = output_root
     .map(PathBuf::from)
     .filter(|value| !value.as_os_str().is_empty())
@@ -1332,6 +1268,7 @@ async fn run_local_pipeline_inner(
   let ffmpeg_available = has_ffmpeg();
   let mut completed = 0_u32;
   let total = blueprint.resource_plan.len() as u32;
+  let mut completed_shot_nos: HashSet<u32> = HashSet::new();
   let temp_root = default_output_root().join("_draft_tmp").join(uid);
   fs::create_dir_all(&temp_root)
     .await
@@ -1358,6 +1295,8 @@ async fn run_local_pipeline_inner(
             message: format!("正在下载{}", resource.title.clone().unwrap_or_else(|| resource.relative_path.clone())),
             current_file: resource.relative_path.clone(),
             current_shot_no: resource.shot_no.unwrap_or(0),
+            completed_shots: completed_shot_nos.len() as u32,
+            total_shots,
             overall_completed: completed,
             overall_total: total,
           },
@@ -1381,6 +1320,8 @@ async fn run_local_pipeline_inner(
             message: "正在下载并转换封面".to_string(),
             current_file: resource.relative_path.clone(),
             current_shot_no: 0,
+            completed_shots: completed_shot_nos.len() as u32,
+            total_shots,
             overall_completed: completed,
             overall_total: total,
           },
@@ -1425,6 +1366,8 @@ async fn run_local_pipeline_inner(
             message: format!("正在准备镜头 {} 的 atlas 原图", resource.shot_no.unwrap_or(0)),
             current_file: resource.relative_path.clone(),
             current_shot_no: resource.shot_no.unwrap_or(0),
+            completed_shots: completed_shot_nos.len() as u32,
+            total_shots,
             overall_completed: completed,
             overall_total: total,
           },
@@ -1437,6 +1380,8 @@ async fn run_local_pipeline_inner(
           &format!("正在裁切镜头 {} 的静态图", resource.shot_no.unwrap_or(0)),
           &resource.relative_path,
           resource.shot_no.unwrap_or(0),
+          completed_shot_nos.len() as u32,
+          total_shots,
           completed,
           total,
         );
@@ -1465,6 +1410,9 @@ async fn run_local_pipeline_inner(
       }
     }
 
+    if let Some(shot_no) = resource.shot_no.filter(|value| *value > 0) {
+      completed_shot_nos.insert(shot_no);
+    }
     completed += 1;
     emit_stage_progress(
       window,
@@ -1473,12 +1421,25 @@ async fn run_local_pipeline_inner(
       &format!("{} 已就绪", resource.relative_path),
       &resource.relative_path,
       resource.shot_no.unwrap_or(0),
+      completed_shot_nos.len() as u32,
+      total_shots,
       completed,
       total,
     );
   }
 
-  emit_stage_progress(window, uid, "building_draft", "正在写入剪映草稿文件", "", 0, completed, total);
+  emit_stage_progress(
+    window,
+    uid,
+    "building_draft",
+    "正在写入剪映草稿文件",
+    "",
+    0,
+    completed_shot_nos.len() as u32,
+    total_shots,
+    completed,
+    total,
+  );
   let draft_content_path = output_dir.join("draft_content.json");
   let draft_meta_info_path = output_dir.join("draft_meta_info.json");
   let manifest_path = output_dir.join("manifest.json");
@@ -1514,7 +1475,7 @@ async fn run_local_pipeline_inner(
     final_video_path: None,
     note: Some(note.clone()),
   };
-  task = update_task_status(
+  let task = update_task_status(
     &client,
     backend_url,
     uid,
@@ -1524,7 +1485,18 @@ async fn run_local_pipeline_inner(
     Some(outputs.clone()),
   )
   .await?;
-  emit_stage_progress(window, uid, "completed", &note, &blueprint.draft_dir_name, 0, total, total);
+  emit_stage_progress(
+    window,
+    uid,
+    "completed",
+    &note,
+    &blueprint.draft_dir_name,
+    0,
+    completed_shot_nos.len() as u32,
+    total_shots,
+    total,
+    total,
+  );
 
   let _ = fs::remove_dir_all(&temp_root).await;
 
@@ -1533,8 +1505,6 @@ async fn run_local_pipeline_inner(
     output_dir: outputs.output_dir.clone().unwrap_or_default(),
     manifest_path: outputs.manifest_path.clone().unwrap_or_default(),
     compose_script_path: outputs.compose_script_path.clone().unwrap_or_default(),
-    final_video_path: None,
-    ffmpeg_executed: false,
     note,
   })
 }
@@ -1560,7 +1530,7 @@ async fn run_local_pipeline(
   let device = build_device_identity();
   let result = run_local_pipeline_inner(&window, &backend_url, &uid, output_root, &device).await;
   if let Err(error) = &result {
-    emit_stage_progress(&window, &uid, "failed", &format!("本地执行失败：{}", error), "", 0, 0, 0);
+    emit_stage_progress(&window, &uid, "failed", &format!("本地执行失败：{}", error), "", 0, 0, 0, 0, 0);
     if let Ok(client) = build_http_client() {
       let _ = update_task_status(
         &client,
