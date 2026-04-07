@@ -49,7 +49,6 @@ interface TaskOutputs {
   outputDir?: string;
   manifestPath?: string;
   composeScriptPath?: string;
-  finalVideoPath?: string;
   note?: string;
 }
 
@@ -77,8 +76,6 @@ interface PipelineResult {
   outputDir: string;
   manifestPath: string;
   composeScriptPath: string;
-  finalVideoPath?: string;
-  ffmpegExecuted: boolean;
   note: string;
 }
 
@@ -88,6 +85,8 @@ interface PipelineProgressPayload {
   message: string;
   currentFile: string;
   currentShotNo: number;
+  completedShots: number;
+  totalShots: number;
   currentFileDownloadedBytes: number;
   currentFileTotalBytes: number;
   currentFileProgress: number;
@@ -99,6 +98,7 @@ interface PipelineProgressPayload {
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8006';
 const TASK_STATUS_POLL_INTERVAL = 3000;
 const PIPELINE_PROGRESS_EVENT = 'local-render-progress';
+const OUTPUT_ROOT_STORAGE_KEY = 'local-render-suite.output-root';
 
 const app = document.querySelector<HTMLDivElement>('#app');
 
@@ -111,9 +111,9 @@ app.innerHTML = `
     <section class="hero">
       <div class="hero-copy">
         <p class="eyebrow">LOCAL RENDER STATION</p>
-        <h1>输入任务 UID，在这台电脑上执行下载与合成</h1>
+        <h1>输入任务 UID，在这台电脑上下载素材并生成剪映草稿</h1>
         <p class="hero-text">
-          桌面端会先认领任务，再下载素材、生成本地清单和合成脚本；如果本机已安装 ffmpeg，会继续尝试自动生成 final.mp4。
+          桌面端会先认领任务，再下载素材并生成本地剪映草稿文件，方便你直接在当前电脑继续检查和导入。
         </p>
       </div>
       <div class="device-panel" id="device-panel">正在读取本机身份...</div>
@@ -124,7 +124,7 @@ app.innerHTML = `
         <div class="panel-head">
           <div>
             <h2>执行面板</h2>
-            <p>输入任务 UID 后即可在当前电脑下载素材并本地合成。</p>
+            <p>输入任务 UID 后即可在当前电脑下载素材并生成剪映草稿。</p>
           </div>
         </div>
 
@@ -156,6 +156,16 @@ app.innerHTML = `
         <div id="result-card" class="result-card">
           <div class="empty-tip">桌面端执行结果会显示在这里</div>
         </div>
+
+        <div class="result-card execution-log-panel">
+          <div class="panel-subhead">
+            <strong>执行日志</strong>
+            <span>同步展示任务状态日志与实时进度</span>
+          </div>
+          <div id="execution-log-card" class="log-box embedded-log-box">
+            <div class="empty-tip">读取任务后，这里的日志会自动刷新</div>
+          </div>
+        </div>
       </section>
 
       <section class="panel">
@@ -182,6 +192,7 @@ const loadTaskBtn = document.querySelector<HTMLButtonElement>('#load-task-btn');
 const runTaskBtn = document.querySelector<HTMLButtonElement>('#run-task-btn');
 const openOutputBtn = document.querySelector<HTMLButtonElement>('#open-output-btn');
 const resultCard = document.querySelector<HTMLDivElement>('#result-card');
+const executionLogCard = document.querySelector<HTMLDivElement>('#execution-log-card');
 const taskCard = document.querySelector<HTMLDivElement>('#task-card');
 
 let deviceIdentity: DeviceIdentity | null = null;
@@ -191,6 +202,8 @@ let taskStatusPollTimer: ReturnType<typeof window.setTimeout> | null = null;
 let taskStatusPolling = false;
 let currentPipelineProgress: PipelineProgressPayload | null = null;
 let unlistenPipelineProgress: UnlistenFn | null = null;
+let runtimeLogLines: string[] = [];
+let lastRuntimeLogKey = '';
 
 /**
  * 时间格式化
@@ -243,14 +256,81 @@ function getStageLabel(stage: string) {
   if (normalized === 'claiming') return '正在认领';
   if (normalized === 'preparing') return '准备目录';
   if (normalized === 'downloading') return '下载素材';
+  if (normalized === 'building_draft') return '生成草稿';
   if (normalized === 'writing_manifest') return '生成清单';
-  if (normalized === 'composing') return '准备合成';
-  if (normalized === 'composing_segment') return '镜头合成';
-  if (normalized === 'composing_final') return '最终合成';
   if (normalized === 'prepared') return '本地任务已就绪';
   if (normalized === 'completed') return '已完成';
   if (normalized === 'failed') return '失败';
   return normalized || '执行中';
+}
+
+/**
+ * 追加实时进度日志
+ * @param progress 进度对象
+ */
+function recordPipelineProgressLog(progress: PipelineProgressPayload) {
+  const stage = String(progress.stage || '').trim();
+  const stageLabel = getStageLabel(stage);
+  const currentPercent = Math.max(0, Math.min(100, Number(progress.currentFileProgress || 0)));
+  const percentBucket = Math.min(100, Math.floor(currentPercent / 5) * 5);
+  const shotSummary = `${progress.completedShots || 0}/${progress.totalShots || 0}`;
+  const resourceSummary = `${progress.overallCompleted || 0}/${progress.overallTotal || 0}`;
+  const fileSummary = progress.currentFile
+    ? `${progress.currentFile} · ${formatBytes(progress.currentFileDownloadedBytes)}`
+      + (progress.currentFileTotalBytes ? ` / ${formatBytes(progress.currentFileTotalBytes)}` : '')
+      + (stage === 'downloading' ? ` · ${currentPercent.toFixed(1)}%` : '')
+    : '';
+  const detail = [
+    progress.message || stageLabel,
+    `镜头 ${shotSummary}`,
+    `资源 ${resourceSummary}`,
+    progress.currentShotNo ? `当前第 ${progress.currentShotNo} 镜` : '',
+    fileSummary,
+  ].filter(Boolean).join(' | ');
+  const dedupeKey = stage === 'downloading'
+    ? [stage, progress.currentFile, progress.currentShotNo, percentBucket, progress.overallCompleted, progress.completedShots].join('|')
+    : [stage, progress.message, progress.currentFile, progress.currentShotNo, progress.overallCompleted, progress.completedShots].join('|');
+
+  if (dedupeKey === lastRuntimeLogKey) {
+    return;
+  }
+
+  lastRuntimeLogKey = dedupeKey;
+  runtimeLogLines.push(`[${formatTime(Date.now())}] [${stage}] ${detail}`);
+  if (runtimeLogLines.length > 200) {
+    runtimeLogLines = runtimeLogLines.slice(-200);
+  }
+}
+
+/**
+ * 阶段轨道
+ * @param stage 当前阶段
+ * @returns 阶段列表
+ */
+function buildStageTrack(stage: string) {
+  const steps = [
+    { key: 'loaded', label: '任务' },
+    { key: 'claiming', label: '认领' },
+    { key: 'preparing', label: '蓝图' },
+    { key: 'downloading', label: '下载' },
+    { key: 'building_draft', label: '草稿' },
+    { key: 'completed', label: '完成' },
+  ];
+  const stageOrder = new Map(steps.map((item, index) => [item.key, index]));
+  const currentIndex = stage === 'failed'
+    ? steps.length - 1
+    : (stageOrder.get(stage) ?? Math.max(0, steps.length - 2));
+
+  return steps.map((item, index) => {
+    const state = stage === 'failed' && index === steps.length - 1
+      ? 'failed'
+      : index < currentIndex
+        ? 'done'
+        : index === currentIndex
+          ? 'active'
+          : 'todo';
+    return { ...item, state };
+  });
 }
 
 /**
@@ -267,6 +347,46 @@ function getBackendUrl() {
  */
 function getTaskUid() {
   return String(taskUidInput?.value || '').trim().toUpperCase();
+}
+
+/**
+ * 读取已保存的输出目录
+ * @returns 本地保存的输出目录
+ */
+function readSavedOutputRoot() {
+  try {
+    return String(window.localStorage.getItem(OUTPUT_ROOT_STORAGE_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 保存输出目录
+ * @param value 输出目录
+ */
+function saveOutputRoot(value: string) {
+  const normalized = String(value || '').trim();
+  try {
+    if (!normalized) {
+      window.localStorage.removeItem(OUTPUT_ROOT_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(OUTPUT_ROOT_STORAGE_KEY, normalized);
+  } catch {
+    // 忽略本地存储异常，避免影响主流程
+  }
+}
+
+/**
+ * 恢复已保存的输出目录
+ */
+function restoreSavedOutputRoot() {
+  if (!outputRootInput) return;
+  const savedOutputRoot = readSavedOutputRoot();
+  if (savedOutputRoot) {
+    outputRootInput.value = savedOutputRoot;
+  }
 }
 
 /**
@@ -288,7 +408,25 @@ function renderDevicePanel() {
 
   if (!outputRootInput?.value) {
     outputRootInput!.value = deviceIdentity.suggestedOutputRoot;
+    saveOutputRoot(deviceIdentity.suggestedOutputRoot);
   }
+}
+
+/**
+ * 渲染执行日志
+ * @param task 任务对象
+ */
+function renderExecutionLogs(task: TaskRecord | null) {
+  if (!executionLogCard) return;
+  const taskLogs = Array.isArray(task?.logs) ? task.logs : [];
+  const taskLines = taskLogs.map(item => `[${formatTime(item.time)}] [${item.status}] ${item.message}`);
+  const allLines = [ ...taskLines, ...runtimeLogLines ];
+
+  if (!allLines.length) {
+    executionLogCard.innerHTML = '<div class="empty-tip">读取任务后，这里的日志会自动刷新</div>';
+    return;
+  }
+  executionLogCard.textContent = allLines.join('\n');
 }
 
 /**
@@ -299,10 +437,11 @@ function renderTaskCard(task: TaskRecord | null) {
   if (!taskCard) return;
   if (!task) {
     taskCard.innerHTML = '<div class="empty-tip">先输入 UID，再读取任务</div>';
+    renderExecutionLogs(null);
     return;
   }
 
-  const logs = Array.isArray(task.logs) ? task.logs : [];
+  renderExecutionLogs(task);
   taskCard.innerHTML = `
     <div class="uid-line">
       <span class="uid-chip">${escapeHtml(task.uid)}</span>
@@ -316,7 +455,6 @@ function renderTaskCard(task: TaskRecord | null) {
     <p><strong>创建时间：</strong>${formatTime(task.createdAt)}</p>
     <p><strong>更新时间：</strong>${formatTime(task.updatedAt)}</p>
     <div class="json-box">${escapeHtml(JSON.stringify(task, null, 2))}</div>
-    <div class="log-box">${escapeHtml(logs.map(item => `[${formatTime(item.time)}] [${item.status}] ${item.message}`).join('\n') || '暂无日志')}</div>
   `;
 }
 
@@ -339,22 +477,64 @@ function renderPipelineProgress(progress: PipelineProgressPayload | null) {
     return;
   }
 
+  const stageLabel = getStageLabel(progress.stage);
   const currentPercent = Math.max(0, Math.min(100, Number(progress.currentFileProgress || 0)));
   const overallPercent = Math.max(0, Math.min(100, Number(progress.overallProgress || 0)));
+  const shotPercent = progress.totalShots
+    ? Math.max(0, Math.min(100, Number(progress.completedShots || 0) / Number(progress.totalShots) * 100))
+    : 0;
   const currentFileText = progress.currentFile
     ? `${escapeHtml(progress.currentFile)} · ${formatBytes(progress.currentFileDownloadedBytes)}`
       + (progress.currentFileTotalBytes ? ` / ${formatBytes(progress.currentFileTotalBytes)}` : '')
     : '当前阶段没有具体文件';
   const currentShotText = progress.currentShotNo ? `当前镜头：第 ${progress.currentShotNo} 镜` : '当前镜头：无';
+  const stageTrack = buildStageTrack(progress.stage)
+    .map(item => `
+      <div class="stage-node stage-node-${item.state}">
+        <span class="stage-node-dot"></span>
+        <span class="stage-node-label">${escapeHtml(item.label)}</span>
+      </div>
+    `)
+    .join('');
 
   renderResult(`
     <div class="progress-box">
+      <div class="stage-track">${stageTrack}</div>
       <div class="progress-box-head">
         <strong>实时进度追踪</strong>
-        <span>${escapeHtml(getStageLabel(progress.stage))}</span>
+        <span>${escapeHtml(stageLabel)}</span>
       </div>
       <div class="progress-message">${escapeHtml(progress.message || '')}</div>
+      <div class="metric-grid">
+        <div class="metric-card">
+          <span>当前阶段</span>
+          <strong>${escapeHtml(stageLabel)}</strong>
+          <em>${escapeHtml(progress.message || '等待更新')}</em>
+        </div>
+        <div class="metric-card">
+          <span>镜头进度</span>
+          <strong>${progress.completedShots || 0} / ${progress.totalShots || 0}</strong>
+          <em>${shotPercent.toFixed(1)}%</em>
+        </div>
+        <div class="metric-card">
+          <span>资源进度</span>
+          <strong>${progress.overallCompleted} / ${progress.overallTotal || 0}</strong>
+          <em>${overallPercent.toFixed(1)}%</em>
+        </div>
+        <div class="metric-card">
+          <span>当前镜头</span>
+          <strong>${progress.currentShotNo ? `第 ${progress.currentShotNo} 镜` : '无'}</strong>
+          <em>${escapeHtml(progress.currentFile || '当前阶段没有具体文件')}</em>
+        </div>
+      </div>
       <div class="progress-meta">${currentShotText}</div>
+      <div class="progress-label-row">
+        <span>镜头完成度</span>
+        <span>${shotPercent.toFixed(1)}%</span>
+      </div>
+      <div class="progress-bar progress-bar-shots">
+        <div class="progress-bar-fill progress-bar-fill-shots" style="width: ${shotPercent}%;"></div>
+      </div>
       <div class="progress-label-row">
         <span>当前文件</span>
         <span>${currentPercent.toFixed(1)}%</span>
@@ -388,6 +568,8 @@ async function bindPipelineProgressListener() {
       return;
     }
     currentPipelineProgress = payload;
+    recordPipelineProgressLog(payload);
+    renderExecutionLogs(currentTask);
     renderPipelineProgress(payload);
   });
 }
@@ -514,7 +696,10 @@ async function runTask() {
   }
 
   runTaskBtn!.disabled = true;
+  runtimeLogLines = [];
+  lastRuntimeLogKey = '';
   currentPipelineProgress = null;
+  renderExecutionLogs(currentTask);
   renderPipelineProgress(null);
   renderResult('<div class="loading-tip">正在本地执行，请稍候...</div>');
 
@@ -533,10 +718,8 @@ async function runTask() {
         <div>执行位置：当前桌面端所在本机</div>
         <div>输出目录：${escapeHtml(result.outputDir)}</div>
         <div>清单文件：${escapeHtml(result.manifestPath)}</div>
-        <div>脚本文件：${escapeHtml(result.composeScriptPath)}</div>
-        <div>自动合成：${result.ffmpegExecuted ? '已执行 ffmpeg' : '未执行 ffmpeg'}</div>
+        <div>草稿内容文件：${escapeHtml(result.composeScriptPath)}</div>
         <div>${escapeHtml(result.note)}</div>
-        ${result.finalVideoPath ? `<div>最终成片：${escapeHtml(result.finalVideoPath)}</div>` : ''}
       </div>
     `);
     startTaskStatusPolling({ silent: true });
@@ -574,6 +757,7 @@ async function pickOutputDirectory() {
     });
     if (!nextPath || !outputRootInput) return;
     outputRootInput.value = nextPath;
+    saveOutputRoot(nextPath);
     renderResult('<div class="success-tip">输出目录已更新</div>');
   } catch (error) {
     renderResult(`<div class="error-tip">${escapeHtml(String(error))}</div>`);
@@ -596,6 +780,10 @@ openOutputBtn?.addEventListener('click', () => {
   void openOutputDir();
 });
 
+outputRootInput?.addEventListener('input', () => {
+  saveOutputRoot(outputRootInput.value);
+});
+
 taskUidInput?.addEventListener('keydown', event => {
   if (event.key === 'Enter') {
     event.preventDefault();
@@ -607,6 +795,9 @@ taskUidInput?.addEventListener('input', () => {
   clearTaskStatusPollTimer();
   currentTask = null;
   currentPipelineProgress = null;
+  runtimeLogLines = [];
+  lastRuntimeLogKey = '';
+  renderTaskCard(null);
   renderPipelineProgress(null);
 });
 
@@ -618,5 +809,6 @@ window.addEventListener('beforeunload', () => {
   }
 });
 
+restoreSavedOutputRoot();
 void bindPipelineProgressListener();
 void loadDeviceIdentity();
