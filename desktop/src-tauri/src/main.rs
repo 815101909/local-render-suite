@@ -419,6 +419,168 @@ fn has_ffmpeg() -> bool {
 }
 
 /**
+ * 读取视频真实时长
+ * @param file_path 本地视频路径
+ * @return {u64} 微秒时长
+ */
+fn get_video_duration_us(file_path: &Path) -> u64 {
+  let output = create_hidden_command("ffprobe")
+    .args([
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      &path_to_string(file_path),
+    ])
+    .output();
+
+  let Ok(output) = output else {
+    return 0;
+  };
+  if !output.status.success() {
+    return 0;
+  }
+
+  let duration_seconds = String::from_utf8_lossy(&output.stdout).trim().parse::<f64>().unwrap_or(0.0);
+  if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+    return 0;
+  }
+  (duration_seconds * 1_000_000.0).round() as u64
+}
+
+/**
+ * 下载后修正草稿里的视频变速与源时长
+ * @param draft_content 草稿内容 JSON
+ * @param manifest 清单 JSON
+ * @param duration_by_absolute_path 绝对路径到真实时长映射
+ * @param duration_by_relative_path 相对路径到真实时长映射
+ */
+fn repair_downloaded_video_timings(
+  draft_content: &mut Value,
+  manifest: &mut Value,
+  duration_by_absolute_path: &HashMap<String, u64>,
+  duration_by_relative_path: &HashMap<String, u64>,
+) {
+  let mut material_duration_by_id: HashMap<String, u64> = HashMap::new();
+  let mut speed_by_id: HashMap<String, f64> = HashMap::new();
+
+  if let Some(video_materials) = draft_content
+    .get_mut("materials")
+    .and_then(|value| value.get_mut("videos"))
+    .and_then(Value::as_array_mut)
+  {
+    for material in video_materials.iter_mut() {
+      let material_type = material.get("type").and_then(Value::as_str).unwrap_or("");
+      if material_type != "video" {
+        continue;
+      }
+      let material_path = material
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .replace('\\', "/");
+      let Some(&actual_duration_us) = duration_by_absolute_path.get(&material_path) else {
+        continue;
+      };
+      if let Some(object) = material.as_object_mut() {
+        object.insert("duration".to_string(), json!(actual_duration_us));
+      }
+      if let Some(material_id) = material.get("id").and_then(Value::as_str) {
+        material_duration_by_id.insert(material_id.to_string(), actual_duration_us);
+      }
+    }
+  }
+
+  if let Some(tracks) = draft_content.get_mut("tracks").and_then(Value::as_array_mut) {
+    for track in tracks.iter_mut() {
+      let Some(segments) = track.get_mut("segments").and_then(Value::as_array_mut) else {
+        continue;
+      };
+      for segment in segments.iter_mut() {
+        if segment.get("type").and_then(Value::as_str) != Some("video") {
+          continue;
+        }
+        let Some(material_id) = segment.get("material_id").and_then(Value::as_str) else {
+          continue;
+        };
+        let Some(&actual_duration_us) = material_duration_by_id.get(material_id) else {
+          continue;
+        };
+        let target_duration_us = segment
+          .get("target_timerange")
+          .and_then(|value| value.get("duration"))
+          .and_then(Value::as_u64)
+          .unwrap_or(0);
+        if target_duration_us == 0 {
+          continue;
+        }
+        let source_duration_us = actual_duration_us.min(target_duration_us);
+        let playback_speed = if actual_duration_us < target_duration_us {
+          actual_duration_us as f64 / target_duration_us as f64
+        } else {
+          1.0
+        };
+
+        if let Some(source_timerange) = segment
+          .get_mut("source_timerange")
+          .and_then(Value::as_object_mut)
+        {
+          source_timerange.insert("duration".to_string(), json!(source_duration_us));
+        }
+        if let Some(object) = segment.as_object_mut() {
+          object.insert("speed".to_string(), json!(playback_speed));
+        }
+
+        if let Some(extra_refs) = segment.get("extra_material_refs").and_then(Value::as_array) {
+          for extra_ref in extra_refs {
+            let Some(speed_id) = extra_ref.as_str() else {
+              continue;
+            };
+            speed_by_id.entry(speed_id.to_string()).or_insert(playback_speed);
+          }
+        }
+      }
+    }
+  }
+
+  if let Some(speed_materials) = draft_content
+    .get_mut("materials")
+    .and_then(|value| value.get_mut("speeds"))
+    .and_then(Value::as_array_mut)
+  {
+    for material in speed_materials.iter_mut() {
+      let Some(speed_id) = material.get("id").and_then(Value::as_str) else {
+        continue;
+      };
+      let Some(&playback_speed) = speed_by_id.get(speed_id) else {
+        continue;
+      };
+      if let Some(object) = material.as_object_mut() {
+        object.insert("speed".to_string(), json!(playback_speed));
+      }
+    }
+  }
+
+  if let Some(shots) = manifest.get_mut("shots").and_then(Value::as_array_mut) {
+    for shot in shots.iter_mut() {
+      let relative_path = shot
+        .get("file")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .replace('\\', "/");
+      let Some(&actual_duration_us) = duration_by_relative_path.get(&relative_path) else {
+        continue;
+      };
+      if let Some(object) = shot.as_object_mut() {
+        object.insert("source_duration_ms".to_string(), json!(actual_duration_us / 1000));
+      }
+    }
+  }
+}
+
+/**
  * 生成本机身份
  * @return {DeviceIdentity} 设备身份对象
  */
@@ -1301,7 +1463,7 @@ async fn run_local_pipeline_inner(
     .map(PathBuf::from)
     .filter(|value| !value.as_os_str().is_empty())
     .unwrap_or_else(default_output_root);
-  let blueprint = fetch_draft_blueprint(&client, backend_url, uid, &path_to_string(&output_root_dir)).await?;
+  let mut blueprint = fetch_draft_blueprint(&client, backend_url, uid, &path_to_string(&output_root_dir)).await?;
   let output_dir = PathBuf::from(&blueprint.draft_root_path);
   fs::create_dir_all(&output_dir)
     .await
@@ -1311,6 +1473,8 @@ async fn run_local_pipeline_inner(
   let mut completed = 0_u32;
   let total = blueprint.resource_plan.len() as u32;
   let mut completed_shot_nos: HashSet<u32> = HashSet::new();
+  let mut video_duration_by_absolute_path: HashMap<String, u64> = HashMap::new();
+  let mut video_duration_by_relative_path: HashMap<String, u64> = HashMap::new();
   let temp_root = default_output_root().join("_draft_tmp").join(uid);
   fs::create_dir_all(&temp_root)
     .await
@@ -1344,6 +1508,13 @@ async fn run_local_pipeline_inner(
           },
         )
         .await?;
+        if resource.media_type == "video" {
+          let actual_duration_us = get_video_duration_us(&target_path);
+          if actual_duration_us > 0 {
+            video_duration_by_absolute_path.insert(path_to_string(&target_path), actual_duration_us);
+            video_duration_by_relative_path.insert(resource.relative_path.replace('\\', "/"), actual_duration_us);
+          }
+        }
       }
       "download_convert_cover" => {
         if !ffmpeg_available {
@@ -1481,6 +1652,12 @@ async fn run_local_pipeline_inner(
     total_shots,
     completed,
     total,
+  );
+  repair_downloaded_video_timings(
+    &mut blueprint.draft_content,
+    &mut blueprint.manifest,
+    &video_duration_by_absolute_path,
+    &video_duration_by_relative_path,
   );
   let draft_content_path = output_dir.join("draft_content.json");
   let draft_meta_info_path = output_dir.join("draft_meta_info.json");

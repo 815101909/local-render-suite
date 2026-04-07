@@ -542,7 +542,10 @@ function renderTaskCard(task: TaskRecord | null) {
     <p><strong>认领设备：</strong>${task.claim ? `${escapeHtml(task.claim.deviceName)} (${escapeHtml(task.claim.deviceId)})` : '未认领'}</p>
     <p><strong>创建时间：</strong>${formatTime(task.createdAt)}</p>
     <p><strong>更新时间：</strong>${formatTime(task.updatedAt)}</p>
-    <div class="json-box">${escapeHtml(JSON.stringify(task, null, 2))}</div>
+    <details class="debug-details">
+      <summary>查看任务原始数据</summary>
+      <div class="json-box">${escapeHtml(JSON.stringify(task, null, 2))}</div>
+    </details>
   `;
 }
 

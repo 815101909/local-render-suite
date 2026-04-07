@@ -296,6 +296,7 @@ input:focus {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
   padding: 14px 16px;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.04);
@@ -307,11 +308,15 @@ input:focus {
   color: var(--muted);
   font-style: normal;
   font-size: 13px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .metric-card strong {
   font-size: 20px;
   line-height: 1.2;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .progress-box-head,
@@ -330,6 +335,8 @@ input:focus {
 .progress-meta {
   color: var(--muted);
   line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .progress-stage {
@@ -389,6 +396,42 @@ input:focus {
   color: #ffb483;
 }
 
+.debug-details {
+  margin-top: 14px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+}
+
+.debug-details summary {
+  padding: 12px 14px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.debug-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.debug-details summary::before {
+  content: ">";
+  display: inline-block;
+  margin-right: 8px;
+  color: var(--accent);
+  transition: transform 0.16s ease;
+}
+
+.debug-details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.debug-details[open] summary {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
 .json-box,
 .log-box {
   margin-top: 14px;
@@ -406,6 +449,11 @@ input:focus {
   margin-top: 0;
   font-family: "Consolas", "SFMono-Regular", monospace;
   font-size: 13px;
+}
+
+.debug-details .json-box {
+  margin-top: 0;
+  border-radius: 0;
 }
 
 .empty-tip,
