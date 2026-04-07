@@ -84,21 +84,21 @@ local-render-suite/
 ## 开发运行
 
 ```powershell
-cd d:\LearnProject\WorkProject\factory\local-render-suite\desktop
-D:\Nodejs\npm.cmd install
-D:\Nodejs\npm.cmd run tauri:dev
+cd local-render-suite\desktop
+npm install
+npm run tauri:dev
 ```
 
 ## 构建桌面端
 
 ```powershell
-cd d:\LearnProject\WorkProject\factory\local-render-suite\desktop
-D:\Nodejs\npm.cmd run tauri:build
+cd local-render-suite\desktop
+npm run tauri:build
 ```
 
 构建产物：
 
-- `d:\LearnProject\WorkProject\factory\local-render-suite\desktop\src-tauri\target\release\local-render-suite-desktop.exe`
+- `local-render-suite\desktop\src-tauri\target\release\local-render-suite-desktop.exe`
 
 ## 桌面端源码位置
 
