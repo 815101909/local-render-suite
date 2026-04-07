@@ -451,6 +451,17 @@ fn get_video_duration_us(file_path: &Path) -> u64 {
 }
 
 /**
+ * 判断文件是否可直接复用
+ * @param file_path 目标文件路径
+ * @return {bool} 是否已存在完整文件
+ */
+fn is_reusable_file(file_path: &Path) -> bool {
+  std::fs::metadata(file_path)
+    .map(|metadata| metadata.is_file() && metadata.len() > 0)
+    .unwrap_or(false)
+}
+
+/**
  * 下载后修正草稿里的视频变速与源时长
  * @param draft_content 草稿内容 JSON
  * @param manifest 清单 JSON
@@ -996,9 +1007,12 @@ async fn download_file_with_progress(
       .map_err(|err| format!("创建目录失败: {}", err))?;
   }
 
+  let temp_path = PathBuf::from(format!("{}.part", target_path.to_string_lossy()));
+  let _ = fs::remove_file(&temp_path).await;
+
   let total_bytes = response.content_length().unwrap_or(0);
   let mut downloaded_bytes = 0_u64;
-  let mut file = File::create(target_path).map_err(|err| format!("创建文件失败: {}", err))?;
+  let mut file = File::create(&temp_path).map_err(|err| format!("创建文件失败: {}", err))?;
 
   emit_pipeline_progress(window, PipelineProgressPayload {
     uid: meta.uid.clone(),
@@ -1052,6 +1066,12 @@ async fn download_file_with_progress(
       updated_at: 0,
     });
   }
+
+  file.flush().map_err(|err| format!("刷新下载文件失败: {}", err))?;
+  drop(file);
+  fs::rename(&temp_path, target_path)
+    .await
+    .map_err(|err| format!("写入目标文件失败: {}", err))?;
 
   Ok(())
 }
@@ -1475,6 +1495,7 @@ async fn run_local_pipeline_inner(
   let mut completed_shot_nos: HashSet<u32> = HashSet::new();
   let mut video_duration_by_absolute_path: HashMap<String, u64> = HashMap::new();
   let mut video_duration_by_relative_path: HashMap<String, u64> = HashMap::new();
+  let mut reused_resources = 0_u32;
   let temp_root = default_output_root().join("_draft_tmp").join(uid);
   fs::create_dir_all(&temp_root)
     .await
@@ -1490,24 +1511,40 @@ async fn run_local_pipeline_inner(
 
     match resource.r#type.as_str() {
       "download" => {
-        download_file_with_progress(
-          window,
-          &client,
-          &resource.source_url,
-          &target_path,
-          DownloadProgressMeta {
-            uid: uid.to_string(),
-            stage: "downloading".to_string(),
-            message: format!("正在下载{}", resource.title.clone().unwrap_or_else(|| resource.relative_path.clone())),
-            current_file: resource.relative_path.clone(),
-            current_shot_no: resource.shot_no.unwrap_or(0),
-            completed_shots: completed_shot_nos.len() as u32,
+        if is_reusable_file(&target_path) {
+          reused_resources += 1;
+          emit_stage_progress(
+            window,
+            uid,
+            "downloading",
+            &format!("复用已下载素材 {}", resource.relative_path),
+            &resource.relative_path,
+            resource.shot_no.unwrap_or(0),
+            completed_shot_nos.len() as u32,
             total_shots,
-            overall_completed: completed,
-            overall_total: total,
-          },
-        )
-        .await?;
+            completed,
+            total,
+          );
+        } else {
+          download_file_with_progress(
+            window,
+            &client,
+            &resource.source_url,
+            &target_path,
+            DownloadProgressMeta {
+              uid: uid.to_string(),
+              stage: "downloading".to_string(),
+              message: format!("正在下载{}", resource.title.clone().unwrap_or_else(|| resource.relative_path.clone())),
+              current_file: resource.relative_path.clone(),
+              current_shot_no: resource.shot_no.unwrap_or(0),
+              completed_shots: completed_shot_nos.len() as u32,
+              total_shots,
+              overall_completed: completed,
+              overall_total: total,
+            },
+          )
+          .await?;
+        }
         if resource.media_type == "video" {
           let actual_duration_us = get_video_duration_us(&target_path);
           if actual_duration_us > 0 {
@@ -1517,105 +1554,169 @@ async fn run_local_pipeline_inner(
         }
       }
       "download_convert_cover" => {
-        if !ffmpeg_available {
-          return Err("当前电脑缺少 ffmpeg，无法把封面转成剪映要求的 JPG".to_string());
-        }
-        const _: () = ();
         let source_temp_path = temp_root.join(sanitize_file_name(&file_name_from_url(&resource.source_url, "cover_source")));
-        download_file_with_progress(
-          window,
-          &client,
-          &resource.source_url,
-          &source_temp_path,
-          DownloadProgressMeta {
-            uid: uid.to_string(),
-            stage: "downloading".to_string(),
-            message: "正在下载并转换封面".to_string(),
-            current_file: resource.relative_path.clone(),
-            current_shot_no: 0,
-            completed_shots: completed_shot_nos.len() as u32,
+        if is_reusable_file(&target_path) {
+          reused_resources += 1;
+          emit_stage_progress(
+            window,
+            uid,
+            "downloading",
+            "复用已生成封面",
+            &resource.relative_path,
+            0,
+            completed_shot_nos.len() as u32,
             total_shots,
-            overall_completed: completed,
-            overall_total: total,
-          },
-        )
-        .await?;
-        let status = create_hidden_command("ffmpeg")
-          .args([
-            "-y",
-            "-i",
-            &path_to_string(&source_temp_path),
-            "-frames:v",
-            "1",
-            "-update",
-            "1",
-            "-q:v",
-            "2",
-            &path_to_string(&target_path),
-          ])
-          .status()
-          .map_err(|err| format!("执行 ffmpeg 转封面失败: {}", err))?;
-        if !status.success() {
-          return Err("封面 JPG 转换失败".to_string());
+            completed,
+            total,
+          );
+        } else {
+          if !ffmpeg_available {
+            return Err("当前电脑缺少 ffmpeg，无法把封面转成剪映要求的 JPG".to_string());
+          }
+          const _: () = ();
+          if is_reusable_file(&source_temp_path) {
+            reused_resources += 1;
+            emit_stage_progress(
+              window,
+              uid,
+              "downloading",
+              "复用已下载封面源文件",
+              &resource.relative_path,
+              0,
+              completed_shot_nos.len() as u32,
+              total_shots,
+              completed,
+              total,
+            );
+          } else {
+            download_file_with_progress(
+              window,
+              &client,
+              &resource.source_url,
+              &source_temp_path,
+              DownloadProgressMeta {
+                uid: uid.to_string(),
+                stage: "downloading".to_string(),
+                message: "正在下载并转换封面".to_string(),
+                current_file: resource.relative_path.clone(),
+                current_shot_no: 0,
+                completed_shots: completed_shot_nos.len() as u32,
+                total_shots,
+                overall_completed: completed,
+                overall_total: total,
+              },
+            )
+            .await?;
+          }
+          let status = create_hidden_command("ffmpeg")
+            .args([
+              "-y",
+              "-i",
+              &path_to_string(&source_temp_path),
+              "-frames:v",
+              "1",
+              "-update",
+              "1",
+              "-q:v",
+              "2",
+              &path_to_string(&target_path),
+            ])
+            .status()
+            .map_err(|err| format!("执行 ffmpeg 转封面失败: {}", err))?;
+          if !status.success() {
+            return Err("封面 JPG 转换失败".to_string());
+          }
         }
       }
       "atlas_crop" => {
-        if !ffmpeg_available {
-          return Err("当前电脑缺少 ffmpeg，无法从 atlas 裁切静态镜头".to_string());
-        }
         let atlas_temp_name = sanitize_file_name(&file_name_from_url(
           &resource.source_url,
           &format!("atlas_{}.png", resource.shot_no.unwrap_or(0)),
         ));
         let atlas_temp_path = temp_root.join(atlas_temp_name);
-        download_file_with_progress(
-          window,
-          &client,
-          &resource.source_url,
-          &atlas_temp_path,
-          DownloadProgressMeta {
-            uid: uid.to_string(),
-            stage: "downloading".to_string(),
-            message: format!("正在准备镜头 {} 的 atlas 原图", resource.shot_no.unwrap_or(0)),
-            current_file: resource.relative_path.clone(),
-            current_shot_no: resource.shot_no.unwrap_or(0),
-            completed_shots: completed_shot_nos.len() as u32,
+        if is_reusable_file(&target_path) {
+          reused_resources += 1;
+          emit_stage_progress(
+            window,
+            uid,
+            "building_draft",
+            &format!("复用镜头 {} 的静态图", resource.shot_no.unwrap_or(0)),
+            &resource.relative_path,
+            resource.shot_no.unwrap_or(0),
+            completed_shot_nos.len() as u32,
             total_shots,
-            overall_completed: completed,
-            overall_total: total,
-          },
-        )
-        .await?;
-        emit_stage_progress(
-          window,
-          uid,
-          "building_draft",
-          &format!("正在裁切镜头 {} 的静态图", resource.shot_no.unwrap_or(0)),
-          &resource.relative_path,
-          resource.shot_no.unwrap_or(0),
-          completed_shot_nos.len() as u32,
-          total_shots,
-          completed,
-          total,
-        );
-        let crop_args = resource.ffmpeg_crop_args.clone().unwrap_or_default();
-        let status = create_hidden_command("ffmpeg")
-          .args([
-            "-y",
-            "-i",
-            &path_to_string(&atlas_temp_path),
-            "-vf",
-            &crop_args,
-            "-frames:v",
-            "1",
-            "-update",
-            "1",
-            &path_to_string(&target_path),
-          ])
-          .status()
-          .map_err(|err| format!("执行 ffmpeg 裁切 atlas 失败: {}", err))?;
-        if !status.success() {
-          return Err(format!("镜头 {} atlas 裁切失败", resource.shot_no.unwrap_or(0)));
+            completed,
+            total,
+          );
+        } else {
+          if !ffmpeg_available {
+            return Err("当前电脑缺少 ffmpeg，无法从 atlas 裁切静态镜头".to_string());
+          }
+          if is_reusable_file(&atlas_temp_path) {
+            reused_resources += 1;
+            emit_stage_progress(
+              window,
+              uid,
+              "downloading",
+              &format!("复用镜头 {} 的 atlas 原图", resource.shot_no.unwrap_or(0)),
+              &resource.relative_path,
+              resource.shot_no.unwrap_or(0),
+              completed_shot_nos.len() as u32,
+              total_shots,
+              completed,
+              total,
+            );
+          } else {
+            download_file_with_progress(
+              window,
+              &client,
+              &resource.source_url,
+              &atlas_temp_path,
+              DownloadProgressMeta {
+                uid: uid.to_string(),
+                stage: "downloading".to_string(),
+                message: format!("正在准备镜头 {} 的 atlas 原图", resource.shot_no.unwrap_or(0)),
+                current_file: resource.relative_path.clone(),
+                current_shot_no: resource.shot_no.unwrap_or(0),
+                completed_shots: completed_shot_nos.len() as u32,
+                total_shots,
+                overall_completed: completed,
+                overall_total: total,
+              },
+            )
+            .await?;
+          }
+          emit_stage_progress(
+            window,
+            uid,
+            "building_draft",
+            &format!("正在裁切镜头 {} 的静态图", resource.shot_no.unwrap_or(0)),
+            &resource.relative_path,
+            resource.shot_no.unwrap_or(0),
+            completed_shot_nos.len() as u32,
+            total_shots,
+            completed,
+            total,
+          );
+          let crop_args = resource.ffmpeg_crop_args.clone().unwrap_or_default();
+          let status = create_hidden_command("ffmpeg")
+            .args([
+              "-y",
+              "-i",
+              &path_to_string(&atlas_temp_path),
+              "-vf",
+              &crop_args,
+              "-frames:v",
+              "1",
+              "-update",
+              "1",
+              &path_to_string(&target_path),
+            ])
+            .status()
+            .map_err(|err| format!("执行 ffmpeg 裁切 atlas 失败: {}", err))?;
+          if !status.success() {
+            return Err(format!("镜头 {} atlas 裁切失败", resource.shot_no.unwrap_or(0)));
+          }
         }
       }
       _ => {
@@ -1686,7 +1787,11 @@ async fn run_local_pipeline_inner(
     .await
     .map_err(|err| format!("写入 README.txt 失败: {}", err))?;
 
-  let note = "已在本机生成剪映草稿文件夹".to_string();
+  let note = if reused_resources > 0 {
+    format!("已在本机生成剪映草稿文件夹，本次续跑复用了 {} 个已完成步骤", reused_resources)
+  } else {
+    "已在本机生成剪映草稿文件夹".to_string()
+  };
   let outputs = TaskOutputs {
     output_dir: Some(path_to_string(&output_dir)),
     manifest_path: Some(path_to_string(&manifest_path)),
