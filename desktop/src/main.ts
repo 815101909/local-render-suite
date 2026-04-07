@@ -6,7 +6,8 @@
  * @Description: Local Render Station 桌面端页面逻辑
  */
 import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import './styles.css';
 
 interface DeviceIdentity {
@@ -69,6 +70,7 @@ interface TaskRecord {
   project: TaskProject;
   shots: TaskShot[];
   logs: TaskLog[];
+  progress?: PipelineProgressPayload | null;
 }
 
 interface PipelineResult {
@@ -93,10 +95,11 @@ interface PipelineProgressPayload {
   overallCompleted: number;
   overallTotal: number;
   overallProgress: number;
+  updatedAt: number;
 }
 
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8006';
-const TASK_STATUS_POLL_INTERVAL = 3000;
+const TASK_STATUS_POLL_INTERVAL = 1000;
 const PIPELINE_PROGRESS_EVENT = 'local-render-progress';
 const OUTPUT_ROOT_STORAGE_KEY = 'local-render-suite.output-root';
 
@@ -160,7 +163,7 @@ app.innerHTML = `
         <div class="result-card execution-log-panel">
           <div class="panel-subhead">
             <strong>执行日志</strong>
-            <span>同步展示任务状态日志与实时进度</span>
+            <span id="execution-log-status">同步展示任务状态日志与实时进度</span>
           </div>
           <div id="execution-log-card" class="log-box embedded-log-box">
             <div class="empty-tip">读取任务后，这里的日志会自动刷新</div>
@@ -192,6 +195,7 @@ const loadTaskBtn = document.querySelector<HTMLButtonElement>('#load-task-btn');
 const runTaskBtn = document.querySelector<HTMLButtonElement>('#run-task-btn');
 const openOutputBtn = document.querySelector<HTMLButtonElement>('#open-output-btn');
 const resultCard = document.querySelector<HTMLDivElement>('#result-card');
+const executionLogStatus = document.querySelector<HTMLSpanElement>('#execution-log-status');
 const executionLogCard = document.querySelector<HTMLDivElement>('#execution-log-card');
 const taskCard = document.querySelector<HTMLDivElement>('#task-card');
 
@@ -265,6 +269,70 @@ function getStageLabel(stage: string) {
 }
 
 /**
+ * 标准化进度对象
+ * @param raw 原始进度数据
+ * @returns 规范化后的进度
+ */
+function normalizePipelineProgress(raw: Partial<PipelineProgressPayload> | null | undefined) {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const uid = String(raw.uid || '').trim().toUpperCase();
+  const stage = String(raw.stage || '').trim();
+  if (!uid || !stage) {
+    return null;
+  }
+
+  return {
+    uid,
+    stage,
+    message: String(raw.message || ''),
+    currentFile: String(raw.currentFile || ''),
+    currentShotNo: Number(raw.currentShotNo || 0) || 0,
+    completedShots: Number(raw.completedShots || 0) || 0,
+    totalShots: Number(raw.totalShots || 0) || 0,
+    currentFileDownloadedBytes: Number(raw.currentFileDownloadedBytes || 0) || 0,
+    currentFileTotalBytes: Number(raw.currentFileTotalBytes || 0) || 0,
+    currentFileProgress: Number(raw.currentFileProgress || 0) || 0,
+    overallCompleted: Number(raw.overallCompleted || 0) || 0,
+    overallTotal: Number(raw.overallTotal || 0) || 0,
+    overallProgress: Number(raw.overallProgress || 0) || 0,
+    updatedAt: Number(raw.updatedAt || 0) || 0,
+  } as PipelineProgressPayload;
+}
+
+/**
+ * 是否应当覆盖当前进度
+ * @param nextProgress 新进度
+ * @returns 是否采纳
+ */
+function shouldApplyPipelineProgress(nextProgress: PipelineProgressPayload | null) {
+  if (!nextProgress) return false;
+  if (!currentPipelineProgress) return true;
+  return Number(nextProgress.updatedAt || 0) >= Number(currentPipelineProgress.updatedAt || 0);
+}
+
+/**
+ * 渲染日志区状态摘要
+ * @param progress 进度对象
+ */
+function renderExecutionLogStatus(progress: PipelineProgressPayload | null) {
+  if (!executionLogStatus) return;
+  if (!progress) {
+    executionLogStatus.textContent = '同步展示任务状态日志与实时进度';
+    return;
+  }
+
+  const stageLabel = getStageLabel(progress.stage);
+  if (progress.totalShots > 0) {
+    executionLogStatus.textContent = `${stageLabel}（${progress.completedShots || 0}/${progress.totalShots}）`;
+    return;
+  }
+  executionLogStatus.textContent = stageLabel;
+}
+
+/**
  * 追加实时进度日志
  * @param progress 进度对象
  */
@@ -300,6 +368,23 @@ function recordPipelineProgressLog(progress: PipelineProgressPayload) {
   if (runtimeLogLines.length > 200) {
     runtimeLogLines = runtimeLogLines.slice(-200);
   }
+}
+
+/**
+ * 用轮询拿到的任务进度刷新页面
+ * @param task 任务对象
+ */
+function syncPipelineProgressFromTask(task: TaskRecord | null) {
+  const taskProgress = normalizePipelineProgress(task?.progress || null);
+  if (shouldApplyPipelineProgress(taskProgress)) {
+    currentPipelineProgress = taskProgress;
+    if (taskProgress) {
+      recordPipelineProgressLog(taskProgress);
+    }
+  }
+
+  renderExecutionLogs(task);
+  renderPipelineProgress(currentPipelineProgress);
 }
 
 /**
@@ -427,6 +512,9 @@ function renderExecutionLogs(task: TaskRecord | null) {
     return;
   }
   executionLogCard.textContent = allLines.join('\n');
+  if (runtimeLogLines.length) {
+    executionLogCard.scrollTop = executionLogCard.scrollHeight;
+  }
 }
 
 /**
@@ -473,10 +561,12 @@ function renderResult(html: string) {
  */
 function renderPipelineProgress(progress: PipelineProgressPayload | null) {
   if (!progress) {
+    renderExecutionLogStatus(null);
     renderResult('<div class="empty-tip">桌面端执行结果会显示在这里</div>');
     return;
   }
 
+  renderExecutionLogStatus(progress);
   const stageLabel = getStageLabel(progress.stage);
   const currentPercent = Math.max(0, Math.min(100, Number(progress.currentFileProgress || 0)));
   const overallPercent = Math.max(0, Math.min(100, Number(progress.overallProgress || 0)));
@@ -560,11 +650,14 @@ function renderPipelineProgress(progress: PipelineProgressPayload | null) {
  */
 async function bindPipelineProgressListener() {
   if (unlistenPipelineProgress) return;
-  unlistenPipelineProgress = await listen<PipelineProgressPayload>(PIPELINE_PROGRESS_EVENT, event => {
-    const payload = event.payload;
+  unlistenPipelineProgress = await getCurrentWindow().listen<PipelineProgressPayload>(PIPELINE_PROGRESS_EVENT, event => {
+    const payload = normalizePipelineProgress(event.payload);
     if (!payload) return;
     const activeUid = getTaskUid();
     if (activeUid && String(payload.uid || '').trim().toUpperCase() !== activeUid) {
+      return;
+    }
+    if (!shouldApplyPipelineProgress(payload)) {
       return;
     }
     currentPipelineProgress = payload;
@@ -612,8 +705,9 @@ async function pollTaskStatus(options?: { silent?: boolean }) {
     });
     currentTask = task;
     renderTaskCard(task);
+    syncPipelineProgressFromTask(task);
     latestOutputDir = String(task.outputs?.outputDir || latestOutputDir || '');
-    if (!options?.silent) {
+    if (!options?.silent && !currentPipelineProgress) {
       renderResult(`<div class="success-tip">已刷新任务状态：${escapeHtml(task.message || task.status)}</div>`);
     }
   } catch (error) {
@@ -675,8 +769,11 @@ async function loadTask() {
       uid,
     });
     renderTaskCard(currentTask);
+    syncPipelineProgressFromTask(currentTask);
     latestOutputDir = String(currentTask.outputs?.outputDir || latestOutputDir || '');
-    renderResult('<div class="success-tip">任务详情读取成功，已开启按 UID 自动轮询状态</div>');
+    if (!currentPipelineProgress) {
+      renderResult('<div class="success-tip">任务详情读取成功，已开启按 UID 自动轮询状态</div>');
+    }
     startTaskStatusPolling({ silent: true });
   } catch (error) {
     renderResult(`<div class="error-tip">${escapeHtml(String(error))}</div>`);
@@ -702,6 +799,7 @@ async function runTask() {
   renderExecutionLogs(currentTask);
   renderPipelineProgress(null);
   renderResult('<div class="loading-tip">正在本地执行，请稍候...</div>');
+  startTaskStatusPolling({ immediate: true, silent: true });
 
   try {
     const result = await invoke<PipelineResult>('run_local_pipeline', {
@@ -712,6 +810,7 @@ async function runTask() {
     currentTask = result.task;
     latestOutputDir = result.outputDir;
     renderTaskCard(currentTask);
+    syncPipelineProgressFromTask(currentTask);
     renderResult(`
       <div class="success-tip">
         <div><strong>执行完成</strong></div>

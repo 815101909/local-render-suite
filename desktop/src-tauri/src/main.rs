@@ -11,7 +11,7 @@
 use reqwest::{header::ACCEPT_ENCODING, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -19,7 +19,9 @@ use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::{Emitter, Window};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{Emitter, Manager, Window};
 use tokio::fs;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -103,6 +105,7 @@ struct TaskRecord {
   project: TaskProject,
   shots: Vec<TaskShot>,
   logs: Vec<TaskLog>,
+  progress: Option<PipelineProgressPayload>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -141,7 +144,7 @@ struct PipelineResult {
   note: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct PipelineProgressPayload {
   uid: String,
@@ -157,6 +160,7 @@ struct PipelineProgressPayload {
   overall_completed: u32,
   overall_total: u32,
   overall_progress: f64,
+  updated_at: u64,
 }
 
 struct DownloadProgressMeta {
@@ -172,6 +176,32 @@ struct DownloadProgressMeta {
 }
 
 const PIPELINE_PROGRESS_EVENT: &str = "local-render-progress";
+
+#[derive(Default)]
+struct PipelineProgressStore {
+  entries: Mutex<HashMap<String, PipelineProgressPayload>>,
+}
+
+impl PipelineProgressStore {
+  /**
+   * 保存任务的最新进度
+   * @param payload 最新进度对象
+   */
+  fn save(&self, payload: PipelineProgressPayload) {
+    let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.insert(payload.uid.clone(), payload);
+  }
+
+  /**
+   * 读取任务的最新进度
+   * @param uid 任务 UID
+   * @return {Option<PipelineProgressPayload>} 最近一次进度
+   */
+  fn get(&self, uid: &str) -> Option<PipelineProgressPayload> {
+    let entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.get(uid).cloned()
+  }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -193,6 +223,12 @@ struct ClaimPayload {
  * 当前时间戳
  * @return {u64} 毫秒时间戳
  */
+fn now_millis() -> u64 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_millis() as u64)
+    .unwrap_or(0)
+}
 
 /**
  * 归一化百分比
@@ -213,7 +249,10 @@ fn to_progress_percent(numerator: u64, denominator: u64) -> f64 {
  * @param window 当前窗口
  * @param payload 进度载荷
  */
-fn emit_pipeline_progress(window: &Window, payload: PipelineProgressPayload) {
+fn emit_pipeline_progress(window: &Window, mut payload: PipelineProgressPayload) {
+  payload.updated_at = now_millis();
+  let progress_store = window.state::<PipelineProgressStore>();
+  progress_store.save(payload.clone());
   let _ = window.emit(PIPELINE_PROGRESS_EVENT, payload);
 }
 
@@ -253,6 +292,7 @@ fn emit_stage_progress(
     overall_completed,
     overall_total,
     overall_progress: to_progress_percent(overall_completed as u64, overall_total as u64),
+    updated_at: 0,
   });
 }
 
@@ -812,6 +852,7 @@ async fn download_file_with_progress(
     overall_completed: meta.overall_completed,
     overall_total: meta.overall_total,
     overall_progress: to_progress_percent(meta.overall_completed as u64, meta.overall_total as u64),
+    updated_at: 0,
   });
 
   let mut response = response;
@@ -846,6 +887,7 @@ async fn download_file_with_progress(
       } else {
         (overall_units / meta.overall_total as f64 * 100.0).clamp(0.0, 100.0)
       },
+      updated_at: 0,
     });
   }
 
@@ -1515,20 +1557,30 @@ async fn get_device_identity() -> Result<DeviceIdentity, String> {
 }
 
 #[tauri::command]
-async fn fetch_task_summary(backend_url: String, uid: String) -> Result<TaskRecord, String> {
+async fn fetch_task_summary(
+  progress_store: tauri::State<'_, PipelineProgressStore>,
+  backend_url: String,
+  uid: String,
+) -> Result<TaskRecord, String> {
   let client = build_http_client()?;
-  fetch_task(&client, &backend_url, &uid).await
+  let mut task = fetch_task(&client, &backend_url, &uid).await?;
+  task.progress = progress_store.get(&task.uid);
+  Ok(task)
 }
 
 #[tauri::command]
 async fn run_local_pipeline(
+  progress_store: tauri::State<'_, PipelineProgressStore>,
   window: Window,
   backend_url: String,
   uid: String,
   output_root: Option<String>,
 ) -> Result<PipelineResult, String> {
   let device = build_device_identity();
-  let result = run_local_pipeline_inner(&window, &backend_url, &uid, output_root, &device).await;
+  let mut result = run_local_pipeline_inner(&window, &backend_url, &uid, output_root, &device).await;
+  if let Ok(pipeline_result) = &mut result {
+    pipeline_result.task.progress = progress_store.get(&uid);
+  }
   if let Err(error) = &result {
     emit_stage_progress(&window, &uid, "failed", &format!("本地执行失败：{}", error), "", 0, 0, 0, 0, 0);
     if let Ok(client) = build_http_client() {
@@ -1609,6 +1661,7 @@ async fn pick_output_directory(current_path: Option<String>) -> Result<Option<St
 
 fn main() {
   tauri::Builder::default()
+    .manage(PipelineProgressStore::default())
     .invoke_handler(tauri::generate_handler![
       get_device_identity,
       fetch_task_summary,
