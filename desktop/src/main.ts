@@ -123,7 +123,7 @@ interface QueueStats {
 
 type NoticeTone = 'info' | 'success' | 'error';
 
-const DEFAULT_BACKEND_URL = 'http://127.0.0.1:19001';
+const DEFAULT_BACKEND_URL = 'http://tb.8000gp.com:19001';
 const TASK_STATUS_POLL_INTERVAL = 1000;
 const PIPELINE_PROGRESS_EVENT = 'local-render-progress';
 const OUTPUT_ROOT_STORAGE_KEY = 'local-render-suite.output-root';
