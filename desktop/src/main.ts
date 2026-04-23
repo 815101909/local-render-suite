@@ -123,7 +123,8 @@ interface QueueStats {
 
 type NoticeTone = 'info' | 'success' | 'error';
 
-const DEFAULT_BACKEND_URL = 'http://tb.8000gp.com:19001';
+const LEGACY_DEFAULT_BACKEND_URL = 'http://tb.8000gp.com:19001';
+const DEFAULT_BACKEND_URL = 'http://127.0.0.1:19001';
 const TASK_STATUS_POLL_INTERVAL = 1000;
 const PIPELINE_PROGRESS_EVENT = 'local-render-progress';
 const OUTPUT_ROOT_STORAGE_KEY = 'local-render-suite.output-root';
@@ -302,6 +303,12 @@ function formatBytes(value: number) {
 
 function getBackendUrl() {
   return String(backendUrlInput?.value || '').trim().replace(/\/+$/g, '');
+}
+
+function normalizeStoredBackendUrl(raw: unknown) {
+  const normalized = String(raw || '').trim().replace(/\/+$/g, '');
+  if (!normalized) return DEFAULT_BACKEND_URL;
+  return normalized === LEGACY_DEFAULT_BACKEND_URL ? DEFAULT_BACKEND_URL : normalized;
 }
 
 function getTaskUid() {
@@ -528,7 +535,7 @@ function normalizeExecutionQueueItem(raw: Partial<ExecutionQueueItem> | null | u
   );
   return {
     uid,
-    backendUrl: String(raw.backendUrl || DEFAULT_BACKEND_URL).trim().replace(/\/+$/g, ''),
+    backendUrl: normalizeStoredBackendUrl(raw.backendUrl),
     outputRoot: String(raw.outputRoot || '').trim(),
     status: String(raw.status || progress?.stage || 'queued').trim(),
     stage: String(raw.stage || progress?.stage || 'queued').trim(),

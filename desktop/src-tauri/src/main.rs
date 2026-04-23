@@ -685,6 +685,15 @@ fn apply_local_subtitle_animation(
   let mut patches: Vec<TextAnimationSegmentPatch> = Vec::new();
   if let Some(tracks) = draft_content.get("tracks").and_then(Value::as_array) {
     for (track_index, track) in tracks.iter().enumerate() {
+      let track_name = track
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+      if track_name.starts_with("关键词轨") {
+        continue;
+      }
+
       let Some(segments) = track.get("segments").and_then(Value::as_array) else {
         continue;
       };
